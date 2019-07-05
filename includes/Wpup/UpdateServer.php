@@ -1,16 +1,32 @@
 <?php
 class Wpup_UpdateServer {
+	const FILE_PER_DAY = 'Y-m-d';
+	const FILE_PER_MONTH = 'Y-m';
+
+	protected $serverDirectory;
 	protected $packageDirectory;
+	protected $bannerDirectory;
+	protected $assetDirectories = array();
+
 	protected $logDirectory;
+	protected $logRotationEnabled = false;
+	protected $logDateSuffix = null;
+	protected $logBackupCount = 0;
+
 	protected $cache;
 	protected $serverUrl;
 	protected $startTime = 0;
 	protected $packageFileLoader = array('Wpup_Package', 'fromArchive');
 
+	protected $ipAnonymizationEnabled = false;
+	protected $ip4Mask = '';
+	protected $ip6Mask = '';
+
 	public function __construct($serverUrl = null, $serverDirectory = null) {
 		if ( $serverDirectory === null ) {
 			$serverDirectory = realpath(__DIR__ . '/../..');
 		}
+		$this->serverDirectory = $serverDirectory;
 		if ( $serverUrl === null ) {
 			$serverUrl = self::guessServerUrl();
 		}
@@ -18,6 +34,19 @@ class Wpup_UpdateServer {
 		$this->serverUrl = $serverUrl;
 		$this->packageDirectory = $serverDirectory . '/packages';
 		$this->logDirectory = $serverDirectory . '/logs';
+
+		$this->bannerDirectory = $serverDirectory . '/package-assets/banners';
+		$this->assetDirectories = array(
+			'banners' => $this->bannerDirectory,
+			'icons'   => $serverDirectory . '/package-assets/icons',
+		);
+
+		//Set up the IP anonymization masks.
+		//For 32-bit addresses, replace the last 8 bits with zeros.
+		$this->ip4Mask = pack('H*', 'ffffff00');
+		//For 128-bit addresses, zero out the last 80 bits.
+		$this->ip6Mask = pack('H*', 'ffffffffffff00000000000000000000');
+
 		$this->cache = new Wpup_FileCache($serverDirectory . '/cache');
 	}
 
@@ -36,16 +65,14 @@ class Wpup_UpdateServer {
 		$path = $_SERVER['SCRIPT_NAME'];
 
 		if ( basename($path) === 'index.php' ) {
-			$dir = dirname($path);
+			$path = dirname($path);
 			if ( DIRECTORY_SEPARATOR === '/' ) {
-				$path = $dir . '/';
-			} else {
-				// Fix Windows
-				$path = str_replace('\\', '/', $dir);
-				//Make sure there's a trailing slash.
-				if ( substr($path, -1) !== '/' ) {
-					$path .= '/';
-				}
+				//Normalize Windows paths.
+				$path = str_replace('\\', '/', $path);
+			}
+			//Make sure there's a trailing slash.
+			if ( substr($path, -1) !== '/' ) {
+				$path .= '/';
 			}
 		}
 
@@ -145,7 +172,7 @@ class Wpup_UpdateServer {
 			$this->exitWithError('You must specify a package slug.', 400);
 		}
 		if ( $request->package === null ) {
-			$this->exitWithError(sprintf('Package "%s" not found', htmlentities($request->slug)), 404);
+			$this->exitWithError('Package not found', 404);
 		}
 	}
 
@@ -172,6 +199,8 @@ class Wpup_UpdateServer {
 	protected function actionGetMetadata(Wpup_Request $request) {
 		$meta = $request->package->getMetadata();
 		$meta['download_url'] = $this->generateDownloadUrl($request->package);
+		$meta['banners'] = $this->getBanners($request->package);
+		$meta['icons'] = $this->getIcons($request->package);
 
 		$meta = $this->filterMetadata($meta, $request);
 
@@ -192,7 +221,7 @@ class Wpup_UpdateServer {
 	 * @param Wpup_Request $request
 	 * @return array Filtered metadata.
 	 */
-	protected function filterMetadata($meta, $request) {
+	protected function filterMetadata($meta, /** @noinspection PhpUnusedParameterInspection */ $request) {
 		//By convention, un-set properties are omitted.
 		$meta = array_filter($meta, function ($value) {
 			return $value !== null;
@@ -266,26 +295,152 @@ class Wpup_UpdateServer {
 	}
 
 	/**
+	 * Find plugin banners.
+	 *
+	 * See WordPress repository docs for more information on banners:
+	 * https://wordpress.org/plugins/about/faq/#banners
+	 *
+	 * @param Wpup_Package $package
+	 * @return array|null
+	 */
+	protected function getBanners(Wpup_Package $package) {
+		//Find the normal banner first. The file name should be slug-772x250.ext.
+		$smallBanner = $this->findFirstAsset($package, 'banners', '-772x250');
+		if ( !empty($smallBanner) ) {
+			$banners = array('low' => $smallBanner);
+
+			//Then find the high-DPI banner.
+			$bigBanner = $this->findFirstAsset($package, 'banners', '-1544x500');
+			if ( !empty($bigBanner) ) {
+				$banners['high'] = $bigBanner;
+			}
+
+			return $banners;
+		}
+
+		return null;
+	}
+
+	/**
+	 * Get a publicly accessible URL for a plugin banner.
+	 *
+	 * @deprecated Use generateAssetUrl() instead.
+	 * @param string $relativeFileName Banner file name relative to the "banners" subdirectory.
+	 * @return string
+	 */
+	protected function generateBannerUrl($relativeFileName) {
+		return $this->generateAssetUrl('banners', $relativeFileName);
+	}
+
+	/**
+	 * Find plugin icons.
+	 *
+	 * @param Wpup_Package $package
+	 * @return array|null
+	 */
+	protected function getIcons(Wpup_Package $package) {
+		$icons = array(
+			'1x'  => $this->findFirstAsset($package, 'icons', '-128x128'),
+			'2x'  => $this->findFirstAsset($package, 'icons', '-256x256'),
+			'svg' => $this->findFirstAsset($package, 'icons', '', 'svg'),
+		);
+
+		$icons = array_filter($icons);
+		if ( !empty($icons) ) {
+			return $icons;
+		}
+		return null;
+	}
+
+	/**
+	 * Get the first asset that has the specified suffix and file name extension.
+	 *
+	 * @param Wpup_Package $package
+	 * @param string $assetType Either 'icons' or 'banners'.
+	 * @param string $suffix Optional file name suffix. For example, "-128x128" for plugin icons.
+	 * @param array|string $extensions Optional. Defaults to common image file formats.
+	 * @return null|string Asset URL, or NULL if there are no matching assets.
+	 */
+	protected function findFirstAsset(
+		Wpup_Package $package,
+		$assetType = 'banners',
+		$suffix = '',
+		$extensions = array('png', 'jpg', 'jpeg')
+	) {
+		$pattern = $this->assetDirectories[$assetType] . '/' . $package->slug . $suffix;
+
+		if ( is_array($extensions) ) {
+			$extensionPattern = '{' . implode(',', $extensions) . '}';
+		} else {
+			$extensionPattern = $extensions;
+		}
+
+		$assets = glob($pattern . '.' . $extensionPattern, GLOB_BRACE | GLOB_NOESCAPE);
+		if ( !empty($assets) ) {
+			$firstFile = basename(reset($assets));
+			return $this->generateAssetUrl($assetType, $firstFile);
+		}
+		return null;
+	}
+
+	/**
+	 * Get a publicly accessible URL for a plugin asset.
+	 *
+	 * @param string $assetType Either 'icons' or 'banners'.
+	 * @param string $relativeFileName File name relative to the asset directory.
+	 * @return string
+	 */
+	protected function generateAssetUrl($assetType, $relativeFileName) {
+		//The current implementation is trivially simple, but you could override this method
+		//to (for example) create URLs that don't rely on the directory being public.
+		$directory = $this->assetDirectories[$assetType];
+		if ( strpos($directory, $this->serverDirectory) === 0 ) {
+			$subDirectory = substr($directory, strlen($this->serverDirectory) + 1);
+		} else {
+			$subDirectory = basename($directory);
+		}
+		$subDirectory = trim($subDirectory, '/\\');
+		return $this->serverUrl . $subDirectory . '/' . $relativeFileName;
+	}
+
+	/**
 	 * Log an API request.
 	 *
 	 * @param Wpup_Request $request
 	 */
 	protected function logRequest($request) {
-		$logFile = $this->logDirectory . '/request.log';
+		$logFile = $this->getLogFileName();
+
+		//If the log file is new, we should rotate old logs.
+		$mustRotate = $this->logRotationEnabled && !file_exists($logFile);
+
 		$handle = fopen($logFile, 'a');
 		if ( $handle && flock($handle, LOCK_EX) ) {
 
+			$loggedIp = $request->clientIp;
+			if ( $this->ipAnonymizationEnabled ) {
+				$loggedIp = $this->anonymizeIp($loggedIp);
+			}
+
 			$columns = array(
-				str_pad($request->clientIp,  15, ' '),
-				str_pad($request->httpMethod, 4, ' '),
-				$request->param('action', '-'),
-				$request->param('slug', '-'),
-				$request->param('installed_version', '-'),
-				isset($request->wpVersion) ? $request->wpVersion : '-',
-				isset($request->wpSiteUrl) ? $request->wpSiteUrl : '-',
-				http_build_query($request->query, '', '&')
+				'ip'                => $loggedIp,
+				'http_method'       => $request->httpMethod,
+				'action'            => $request->param('action', '-'),
+				'slug'              => $request->param('slug', '-'),
+				'installed_version' => $request->param('installed_version', '-'),
+				'wp_version'        => isset($request->wpVersion) ? $request->wpVersion : '-',
+				'site_url'          => isset($request->wpSiteUrl) ? $request->wpSiteUrl : '-',
+				'query'             => http_build_query($request->query, '', '&'),
 			);
-			$columns = $this->filterLogInfo($columns);
+			$columns = $this->filterLogInfo($columns, $request);
+			$columns = $this->escapeLogInfo($columns);
+
+			if ( isset($columns['ip']) ) {
+				$columns['ip'] = str_pad($columns['ip'], 15, ' ');
+			}
+			if ( isset($columns['http_method']) ) {
+				$columns['http_method'] = str_pad($columns['http_method'], 4, ' ');
+			}
 
 			//Set the time zone to whatever the default is to avoid PHP notices.
 			//Will default to UTC if it's not set properly in php.ini.
@@ -294,6 +449,10 @@ class Wpup_UpdateServer {
 			$line = date('[Y-m-d H:i:s O]') . ' ' . implode("\t", $columns) . "\n";
 
 			fwrite($handle, $line);
+
+			if ( $mustRotate ) {
+				$this->rotateLogs();
+			}
 			flock($handle, LOCK_UN);
 		}
 		if ( $handle ) {
@@ -302,14 +461,149 @@ class Wpup_UpdateServer {
 	}
 
 	/**
+	 * @return string
+	 */
+	protected function getLogFileName() {
+		$path = $this->logDirectory . '/request';
+		if ( $this->logRotationEnabled ) {
+			$path .= '-' . date($this->logDateSuffix);
+		}
+		return $path . '.log';
+	}
+
+	/**
 	 * Adjust information that will be logged.
 	 * Intended to be overridden in child classes.
 	 *
 	 * @param array $columns List of columns in the log entry.
+	 * @param Wpup_Request|null $request
 	 * @return array
 	 */
-	protected function filterLogInfo($columns) {
+	protected function filterLogInfo($columns, /** @noinspection PhpUnusedParameterInspection */$request = null) {
 		return $columns;
+	}
+
+	/**
+	 * Escapes passed log data so it can be safely written into a plain text file.
+	 *
+	 * @param string[] $columns List of columns in the log entry.
+	 * @return string[] Escaped $columns.
+	 */
+	protected function escapeLogInfo(array $columns) {
+		return array_map(array($this, 'escapeLogValue'), $columns);
+	}
+
+	/**
+	 * Escapes passed value to be safely written into a plain text file.
+	 *
+	 * @param string|null $value Value to escape.
+	 * @return string|null Escaped value.
+	 */
+	protected function escapeLogValue($value) {
+
+		if (!isset($value)) {
+			return null;
+		}
+
+		$value = (string)$value;
+
+		$regex = '/[[:^graph:]]/';
+
+		//preg_replace_callback will return NULL if the input contains invalid Unicode sequences,
+		//so only enable the Unicode flag if the input encoding looks valid.
+		/** @noinspection PhpComposerExtensionStubsInspection */
+		if ( function_exists('mb_check_encoding') && mb_check_encoding($value, 'UTF-8') ) {
+			$regex = $regex . 'u';
+		}
+
+		$value = str_replace('\\', '\\\\', $value);
+		$value = preg_replace_callback(
+			$regex,
+			function(array $matches) {
+				$length = strlen($matches[0]);
+				$escaped = '';
+				for($i = 0; $i < $length; $i++) {
+					//Convert the character to a hexadecimal escape sequence.
+					$hexCode = dechex(ord($matches[0][$i]));
+					$escaped .= '\x' . strtoupper(str_pad($hexCode, 2, '0', STR_PAD_LEFT));
+				}
+				return $escaped;
+			},
+			$value
+		);
+
+		return $value;
+	}
+
+	/**
+	 * Enable basic log rotation.
+	 * Defaults to monthly rotation.
+	 *
+	 * @param string|null $rotationPeriod Either Wpup_UpdateServer::FILE_PER_DAY or Wpup_UpdateServer::FILE_PER_MONTH.
+	 * @param int $filesToKeep The max number of log files to keep. Zero = unlimited.
+	 */
+	public function enableLogRotation($rotationPeriod = null, $filesToKeep = 10) {
+		if ( !isset($rotationPeriod) ) {
+			$rotationPeriod = self::FILE_PER_MONTH;
+		}
+
+		$this->logDateSuffix = $rotationPeriod;
+		$this->logBackupCount = $filesToKeep;
+		$this->logRotationEnabled = true;
+	}
+
+	/**
+	 * Delete old log files.
+	 */
+	protected function rotateLogs() {
+		//Skip GC of old files if the backup count is unlimited.
+		if ( $this->logBackupCount === 0 ) {
+			return;
+		}
+
+		//Find log files.
+		$logFiles = glob($this->logDirectory . '/request*.log', GLOB_NOESCAPE);
+		if ( count($logFiles) <= $this->logBackupCount ) {
+			return;
+		}
+
+		//Sort the files by name. Due to the date suffix format, this also sorts them by date.
+		usort($logFiles, 'strcmp');
+		//Put them in descending order.
+		$logFiles = array_reverse($logFiles);
+
+		//Keep the most recent $logBackupCount files, delete the rest.
+		foreach(array_slice($logFiles, $this->logBackupCount) as $fileName) {
+			@unlink($fileName);
+		}
+	}
+
+	/**
+	 * Enable basic IP address anonymization.
+	 */
+	public function enableIpAnonymization() {
+		$this->ipAnonymizationEnabled = true;
+	}
+
+	/**
+	 * Anonymize an IP address by replacing the last byte(s) with zeros.
+	 *
+	 * @param string $ip A valid IP address such as "12.45.67.89" or "2001:db8:85a3::8a2e:370:7334".
+	 * @return string
+	 */
+	protected function anonymizeIp($ip) {
+		$binaryIp = @inet_pton($ip);
+		if ( strlen($binaryIp) === 4 ) {
+			//IPv4
+			$anonBinaryIp = $binaryIp & $this->ip4Mask;
+		} else if ( strlen($binaryIp) === 16 ) {
+			//IPv6
+			$anonBinaryIp = $binaryIp & $this->ip6Mask;
+		} else {
+			//The input is not a valid IPv4 or IPv6 address. Return it unmodified.
+			return $ip;
+		}
+		return inet_ntop($anonBinaryIp);
 	}
 
 	/**
@@ -318,8 +612,7 @@ class Wpup_UpdateServer {
 	 * @param mixed $response
 	 */
 	protected function outputAsJson($response) {
-		header('Content-Type: application/json');
-		$output = '';
+		header('Content-Type: application/json; charset=utf-8');
 		if ( defined('JSON_PRETTY_PRINT') ) {
 			$output = json_encode($response, JSON_PRETTY_PRINT);
 		} elseif ( function_exists('wsh_pretty_json') ) {
@@ -366,7 +659,7 @@ class Wpup_UpdateServer {
 			504 => '504 Gateway Timeout',
 			505 => '505 HTTP Version Not Supported'
 		);
-		
+
 		if ( !isset($_SERVER['SERVER_PROTOCOL']) || $_SERVER['SERVER_PROTOCOL'] === '' ) {
 			$protocol = 'HTTP/1.1';
 		} else {
@@ -381,7 +674,7 @@ class Wpup_UpdateServer {
 			header('X-Ws-Update-Server-Error: ' . $httpStatus, true, $httpStatus);
 			$title = 'HTTP ' . $httpStatus;
 		}
-		
+
 		if ( $message === '' ) {
 			$message = $title;
 		}
